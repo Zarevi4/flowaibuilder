@@ -22,7 +22,7 @@ export type WebSocketEventType =
   | 'zone_deleted';
 
 export interface WebSocketMessage {
-  event: WebSocketEventType;
+  type: WebSocketEventType;
   workflowId: string;
   data: unknown;
   timestamp: string;
