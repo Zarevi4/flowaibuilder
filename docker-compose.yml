@@ -43,6 +43,8 @@ services:
       WS_PORT: "5174"
       JWT_SECRET: flowaibuilder-dev-jwt-secret
       ENCRYPTION_KEY: flowaibuilder-dev-encrypt-key32
+      ADMIN_EMAIL: admin@flowaibuilder.local
+      ADMIN_PASSWORD: admin
       CLAUDE_TEAMS_DIR: /data/teams
     depends_on:
       postgres:

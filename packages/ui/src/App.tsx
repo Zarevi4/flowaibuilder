@@ -1,5 +1,6 @@
+import { useEffect, useState } from 'react';
 import { BrowserRouter, Routes, Route, Link } from 'react-router-dom';
-import { Zap, Users } from 'lucide-react';
+import { Zap, Users, LogOut } from 'lucide-react';
 import { Dashboard } from './pages/Dashboard';
 import { Editor } from './pages/Editor';
 import { ExecutionHistory } from './pages/ExecutionHistory';
@@ -7,8 +8,38 @@ import { ExecutionDetail } from './pages/ExecutionDetail';
 import { TeamDashboard } from './pages/TeamDashboard';
 import { AuditLog } from './pages/AuditLog';
 import { Settings } from './pages/Settings';
+import { Login } from './pages/Login';
+import { getCurrentUser, type CurrentUser } from './lib/api';
 
 export default function App() {
+  const [user, setUser] = useState<CurrentUser | null>(null);
+  const [checking, setChecking] = useState(true);
+
+  const checkAuth = () => {
+    getCurrentUser()
+      .then(setUser)
+      .finally(() => setChecking(false));
+  };
+
+  useEffect(() => { checkAuth(); }, []);
+
+  if (checking) {
+    return (
+      <div className="h-full flex items-center justify-center bg-gray-950">
+        <div className="w-5 h-5 border-2 border-purple-500 border-t-transparent rounded-full animate-spin" />
+      </div>
+    );
+  }
+
+  if (!user) {
+    return <Login onLogin={checkAuth} />;
+  }
+
+  const handleLogout = async () => {
+    await fetch('/api/auth/logout', { method: 'POST', credentials: 'include' }).catch(() => {});
+    setUser(null);
+  };
+
   return (
     <BrowserRouter>
       <div className="h-full flex flex-col bg-gray-950">
@@ -28,6 +59,12 @@ export default function App() {
             <Link to="/audit-log" className="text-gray-400 hover:text-white text-sm">Audit Log</Link>
             <Link to="/settings" className="text-gray-400 hover:text-white text-sm">Settings</Link>
           </nav>
+          <div className="ml-auto flex items-center gap-3">
+            <span className="text-gray-500 text-xs">{user.email}</span>
+            <button onClick={handleLogout} className="text-gray-500 hover:text-white" title="Sign out">
+              <LogOut size={14} />
+            </button>
+          </div>
         </header>
 
         {/* Routes */}
