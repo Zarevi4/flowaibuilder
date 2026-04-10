@@ -4,14 +4,18 @@ This file provides guidance to Claude Code when working in this repository.
 
 ## Project Overview
 
-**flowAIbuilder** is an open-source workflow automation engine (MIT license) - a direct alternative to n8n with AI-native architecture. All enterprise features are free.
+**flowAIbuilder** is the visual control center for Claude Code (MIT license). Watch AI agents build workflows in real-time. Review what they built. Pin what works. Let them iterate on the rest.
 
-Key differentiators from n8n:
-1. **AI-native**: MCP server built in - Claude Code creates, edits, executes workflows directly
-2. **AI Review**: Claude (user's subscription) analyzes workflows via MCP, annotates canvas with errors/warnings/suggestions. Zero cost for us - we just serve data, Claude thinks.
-3. **Agent Teams Dashboard**: Visual control center for Claude Code Agent Teams. Watches ~/.claude/teams/ files, shows agents/tasks/messages on canvas.
+**Positioning**: NOT an "n8n alternative". We are the visual layer for Claude Code power users who want to SEE what their agents are doing.
+
+Key features (in priority order):
+1. **Visual Canvas**: React Flow workflow editor — the substrate where agents build
+2. **Agent Teams Dashboard**: Visual control center for Claude Code Agent Teams. Watches ~/.claude/teams/ files, shows agents/tasks/messages on canvas. THIS IS THE KILLER FEATURE — nobody else has it.
+3. **AI Review**: Claude (user's subscription) analyzes workflows via MCP, annotates canvas with errors/warnings/suggestions. Zero cost — we serve data, Claude thinks.
 4. **Protected Zones**: Pin working nodes so AI can't modify them. Server-side enforcement via MCP.
-5. **All enterprise free**: SSO, audit logs, git sync, environments, queue scaling, RBAC - no paywall.
+5. **MCP-native**: Built-in MCP server — Claude Code creates, edits, executes workflows directly.
+
+**Epic execution order**: Epic 1 (Canvas) → Epic 6 (Agent Teams) → Epic 2 (AI Review) → Epic 3 (Zones) → Epic 4 (Export/Deploy) → Epic 5 (Enterprise). See `Claude Instructions/sprint-execution-order.md`.
 
 ## Architecture
 
@@ -26,7 +30,7 @@ docker-compose.yml
 - **Server**: Fastify API + built-in MCP server (stdio + HTTP/SSE transport) + WebSocket broadcaster
 - **Engine**: Node executor with VM sandbox for Code nodes
 - **UI**: React Flow canvas with custom nodes, config sidebar, export panel, annotation overlays, zone boundaries, agent team dashboard
-- **DB**: PostgreSQL (prod) / SQLite (dev) via Drizzle ORM
+- **DB**: PostgreSQL via Drizzle ORM (both dev and prod — we rely on Postgres-native JSON operators like `metadata->>'key'`, so SQLite is not supported)
 - **Queue**: BullMQ + Redis for parallel execution
 - **Auth**: Lucia (local + SSO/SAML/LDAP)
 

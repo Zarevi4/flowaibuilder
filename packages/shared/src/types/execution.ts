@@ -1,4 +1,4 @@
-export type ExecutionStatus = 'pending' | 'running' | 'success' | 'error' | 'cancelled';
+export type ExecutionStatus = 'pending' | 'running' | 'success' | 'error' | 'cancelled' | 'queued';
 export type ExecutionMode = 'manual' | 'trigger' | 'webhook' | 'retry' | 'mcp';
 
 export interface NodeExecutionData {

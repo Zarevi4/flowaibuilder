@@ -27,6 +27,45 @@ services:
       timeout: 5s
       retries: 5
 
+  flowaibuilder-server:
+    build:
+      context: .
+      dockerfile: packages/server/Dockerfile
+    ports:
+      - "3000:3000"
+      - "5174:5174"
+    volumes:
+      - ${HOME}/.claude/teams:/data/teams:ro
+    environment:
+      DATABASE_URL: postgres://flowaibuilder:flowaibuilder@postgres:5432/flowaibuilder
+      REDIS_URL: redis://redis:6379
+      PORT: "3000"
+      WS_PORT: "5174"
+      JWT_SECRET: flowaibuilder-dev-jwt-secret
+      ENCRYPTION_KEY: flowaibuilder-dev-encrypt-key32
+      CLAUDE_TEAMS_DIR: /data/teams
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:3000/api/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  flowaibuilder-ui:
+    build:
+      context: .
+      dockerfile: packages/ui/Dockerfile
+    ports:
+      - "5173:5173"
+    depends_on:
+      flowaibuilder-server:
+        condition: service_healthy
+
 volumes:
   pgdata:
   redisdata:

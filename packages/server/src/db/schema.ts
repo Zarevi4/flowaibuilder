@@ -1,4 +1,5 @@
-import { pgTable, text, integer, boolean, jsonb, timestamp, uuid } from 'drizzle-orm/pg-core';
+import { pgTable, text, integer, boolean, jsonb, timestamp, uuid, unique, uniqueIndex } from 'drizzle-orm/pg-core';
+import { sql } from 'drizzle-orm';
 
 // ─── WORKFLOWS ──────────────────────────────────────────────
 export const workflows = pgTable('workflows', {
@@ -30,7 +31,7 @@ export const workflows = pgTable('workflows', {
 // ─── EXECUTIONS ─────────────────────────────────────────────
 export const executions = pgTable('executions', {
   id: uuid('id').primaryKey().defaultRandom(),
-  workflowId: uuid('workflow_id').references(() => workflows.id),
+  workflowId: uuid('workflow_id').references(() => workflows.id).notNull(),
   workflowVersion: integer('workflow_version'),
 
   status: text('status').notNull(), // running|success|error|cancelled
@@ -75,7 +76,9 @@ export const workflowVersions = pgTable('workflow_versions', {
 
   createdBy: text('created_by').notNull(),
   createdAt: timestamp('created_at').defaultNow(),
-});
+}, (table) => [
+  unique('workflow_version_unique').on(table.workflowId, table.version),
+]);
 
 // ─── USERS ──────────────────────────────────────────────────
 export const users = pgTable('users', {
@@ -89,6 +92,18 @@ export const users = pgTable('users', {
   createdAt: timestamp('created_at').defaultNow(),
 });
 
+// ─── SESSIONS ───────────────────────────────────────────────
+export const sessions = pgTable('sessions', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  userId: uuid('user_id').references(() => users.id, { onDelete: 'cascade' }).notNull(),
+  tokenHash: text('token_hash').notNull().unique(),
+  expiresAt: timestamp('expires_at').notNull(),
+  createdAt: timestamp('created_at').defaultNow(),
+  lastSeenAt: timestamp('last_seen_at'),
+  ip: text('ip'),
+  userAgent: text('user_agent'),
+});
+
 // ─── CREDENTIALS ────────────────────────────────────────────
 export const credentials = pgTable('credentials', {
   id: uuid('id').primaryKey().defaultRandom(),
@@ -98,7 +113,9 @@ export const credentials = pgTable('credentials', {
   createdBy: text('created_by').notNull(),
   createdAt: timestamp('created_at').defaultNow(),
   updatedAt: timestamp('updated_at').defaultNow(),
-});
+}, (table) => [
+  uniqueIndex('credentials_name_unique').on(sql`lower(${table.name})`),
+]);
 
 // ─── ANNOTATIONS ────────────────────────────────────────────
 export const annotations = pgTable('annotations', {
@@ -151,3 +168,33 @@ export const protectedZones = pgTable('protected_zones', {
 
   canUnpin: jsonb('can_unpin').default([]),
 });
+
+// ─── INSTANCE SETTINGS ──────────────────────────────────────
+export const instanceSettings = pgTable('instance_settings', {
+  id: text('id').primaryKey().default('singleton'),
+  timezone: text('timezone').default('UTC'),
+  autoReviewEnabled: boolean('auto_review_enabled').default(false),
+  errorWorkflowId: text('error_workflow_id'),
+  // Git sync (Story 5.3)
+  gitRepoUrl: text('git_repo_url'),
+  gitBranch: text('git_branch').default('main'),
+  gitAuthorName: text('git_author_name'),
+  gitAuthorEmail: text('git_author_email'),
+  gitTokenEncrypted: text('git_token_encrypted'),
+  gitSyncEnabled: boolean('git_sync_enabled').default(false),
+  // Log streaming (Story 5.5)
+  logStreamDestinations: jsonb('log_stream_destinations').default([]),
+  updatedAt: timestamp('updated_at').defaultNow(),
+});
+
+// ─── TASK NODE LINKS ────────────────────────────────────────
+export const taskNodeLinks = pgTable('task_node_links', {
+  id: uuid('id').primaryKey().defaultRandom(),
+  teamName: text('team_name').notNull(),
+  taskId: text('task_id').notNull(),
+  workflowId: uuid('workflow_id').notNull().references(() => workflows.id, { onDelete: 'cascade' }),
+  nodeId: text('node_id').notNull(),
+  createdAt: timestamp('created_at').notNull().defaultNow(),
+}, (table) => [
+  unique('task_node_link_unique').on(table.teamName, table.taskId, table.workflowId, table.nodeId),
+]);

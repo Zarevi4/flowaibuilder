@@ -11,6 +11,7 @@
     "build": "npm run build -w packages/shared && npm run build -w packages/server && npm run build -w packages/ui",
     "build:server": "npm run build -w packages/server",
     "build:ui": "npm run build -w packages/ui",
+    "test": "npm run test -w packages/server",
     "db:push": "npm run db:push -w packages/server",
     "db:migrate": "npm run db:migrate -w packages/server",
     "db:studio": "npm run db:studio -w packages/server"

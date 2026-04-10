@@ -1,0 +1,1714 @@
+diff --git a/packages/shared/src/types/mcp.ts b/packages/shared/src/types/mcp.ts
+index 93c1042..9d6cf71 100644
+--- a/packages/shared/src/types/mcp.ts
++++ b/packages/shared/src/types/mcp.ts
+@@ -5,6 +5,8 @@ export interface McpToolResult {
+ }
+ 
+ export type WebSocketEventType =
++  | 'connected'
++  | 'full_sync'
+   | 'workflow_created'
+   | 'workflow_updated'
+   | 'workflow_deleted'
+@@ -18,8 +20,16 @@ export type WebSocketEventType =
+   | 'execution_completed'
+   | 'annotation_added'
+   | 'annotations_updated'
++  | 'annotation_applied'
++  | 'review_completed'
++  | 'review_requested'
+   | 'zone_created'
+-  | 'zone_deleted';
++  | 'zone_deleted'
++  | 'agent_messages_updated'
++  | 'team_tasks_updated'
++  | 'team_watch_started'
++  | 'team_watch_stopped'
++  | 'task_linked_to_node';
+ 
+ export interface WebSocketMessage {
+   type: WebSocketEventType;
+diff --git a/packages/server/src/api/routes/review.ts b/packages/server/src/api/routes/review.ts
+new file mode 100644
+index 0000000..4e08d27
+--- /dev/null
++++ b/packages/server/src/api/routes/review.ts
+@@ -0,0 +1,119 @@
++/**
++ * Review REST endpoints — thin wrappers over annotationStore + extracted MCP
++ * handlers (handleApplyFix / handleDismissAnnotation). All mutation logic
++ * lives in packages/server/src/mcp/tools/review.ts; this module adds browser
++ * callable paths only.
++ *
++ * Wire-shape note: these endpoints return **camelCase** shapes matching
++ * `annotationStore.getLatestReview` and `Annotation`, NOT the snake_case wire
++ * shape returned by `flowaibuilder.get_health_score`. The UI consumes
++ * camelCase consistently.
++ *
++ * Zero-cost AI: no Anthropic SDK, no direct AI calls. `review/request` simply
++ * emits a WebSocket event and returns a prompt string for Claude Code.
++ */
++import type { FastifyInstance } from 'fastify';
++import { eq } from 'drizzle-orm';
++import { db } from '../../db/index.js';
++import { workflows } from '../../db/schema.js';
++import { annotationStore } from '../../review/store.js';
++import { handleApplyFix, handleDismissAnnotation } from '../../mcp/tools/review.js';
++import { getBroadcaster } from '../ws/broadcaster.js';
++
++async function workflowExists(id: string): Promise<boolean> {
++  const [row] = await db.select().from(workflows).where(eq(workflows.id, id));
++  return !!row;
++}
++
++export async function registerReviewRoutes(app: FastifyInstance) {
++  // List active annotations
++  app.get<{ Params: { id: string } }>('/api/workflows/:id/annotations', async (request, reply) => {
++    if (!(await workflowExists(request.params.id))) {
++      return reply.code(404).send({ error: 'Workflow not found' });
++    }
++    const annotations = await annotationStore.getAnnotations(request.params.id, { status: 'active' });
++    return { annotations };
++  });
++
++  // Latest health score
++  app.get<{ Params: { id: string } }>('/api/workflows/:id/health', async (request, reply) => {
++    if (!(await workflowExists(request.params.id))) {
++      return reply.code(404).send({ error: 'Workflow not found' });
++    }
++    const latest = await annotationStore.getLatestReview(request.params.id);
++    if (!latest) {
++      return {
++        healthScore: null,
++        scores: null,
++        summary: null,
++        reviewId: null,
++        reviewType: null,
++        annotationCount: 0,
++        createdAt: null,
++      };
++    }
++    return {
++      healthScore: latest.healthScore,
++      scores: latest.scores,
++      summary: latest.summary,
++      reviewId: latest.reviewId,
++      reviewType: latest.reviewType,
++      annotationCount: latest.annotationCount,
++      createdAt: latest.createdAt,
++    };
++  });
++
++  // Apply fix
++  app.post<{ Params: { id: string; annotationId: string } }>(
++    '/api/workflows/:id/annotations/:annotationId/apply',
++    async (request, reply) => {
++      if (!(await workflowExists(request.params.id))) {
++        return reply.code(404).send({ error: 'Workflow not found' });
++      }
++      try {
++        const result = await handleApplyFix({
++          workflow_id: request.params.id,
++          annotation_id: request.params.annotationId,
++        });
++        return result;
++      } catch (err) {
++        return reply.code(400).send({ error: (err as Error).message });
++      }
++    },
++  );
++
++  // Dismiss annotation
++  app.post<{ Params: { id: string; annotationId: string }; Body: { reason?: string } }>(
++    '/api/workflows/:id/annotations/:annotationId/dismiss',
++    async (request, reply) => {
++      if (!(await workflowExists(request.params.id))) {
++        return reply.code(404).send({ error: 'Workflow not found' });
++      }
++      try {
++        const result = await handleDismissAnnotation({
++          workflow_id: request.params.id,
++          annotation_id: request.params.annotationId,
++          reason: request.body?.reason,
++        });
++        return result;
++      } catch (err) {
++        return reply.code(400).send({ error: (err as Error).message });
++      }
++    },
++  );
++
++  // Request review — broadcasts `review_requested` + returns paste-prompt
++  app.post<{ Params: { id: string } }>('/api/workflows/:id/review/request', async (request, reply) => {
++    if (!(await workflowExists(request.params.id))) {
++      return reply.code(404).send({ error: 'Workflow not found' });
++    }
++    const id = request.params.id;
++    getBroadcaster()?.broadcast('review_requested', id, {
++      workflow_id: id,
++      requested_at: new Date().toISOString(),
++    });
++    return {
++      prompt: `Review workflow ${id}. Use flowaibuilder.get_review_context to fetch context and flowaibuilder.save_annotations to write findings.`,
++    };
++  });
++}
+diff --git a/packages/server/src/mcp/tools/review.ts b/packages/server/src/mcp/tools/review.ts
+new file mode 100644
+index 0000000..0170ed6
+--- /dev/null
++++ b/packages/server/src/mcp/tools/review.ts
+@@ -0,0 +1,355 @@
++import { z } from 'zod';
++import { eq, desc } from 'drizzle-orm';
++import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
++import type {
++  Workflow,
++  WorkflowNode,
++  Connection,
++  AnnotationInput,
++} from '@flowaibuilder/shared';
++import { db } from '../../db/index.js';
++import { workflows, executions, protectedZones } from '../../db/schema.js';
++import { getBroadcaster } from '../../api/ws/broadcaster.js';
++import { buildReviewContext } from '../../review/context-builder.js';
++import { annotationStore } from '../../review/store.js';
++import { dispatchFix, UnknownFixToolError } from '../../review/fix-dispatcher.js';
++
++function mcpError(message: string, extra?: Record<string, unknown>) {
++  return {
++    content: [{ type: 'text' as const, text: JSON.stringify({ error: message, ...extra }) }],
++    isError: true,
++  };
++}
++
++function toWorkflow(row: typeof workflows.$inferSelect): Workflow {
++  return {
++    id: row.id,
++    name: row.name,
++    description: row.description ?? '',
++    nodes: (row.nodes ?? []) as WorkflowNode[],
++    connections: (row.connections ?? []) as Connection[],
++    active: row.active ?? false,
++    version: row.version ?? 1,
++    environment: row.environment ?? 'dev',
++    canvas: (row.canvas ?? {}) as Record<string, unknown>,
++    settings: (row.settings ?? {}) as Record<string, unknown>,
++    tags: (row.tags ?? []) as string[],
++    createdBy: row.createdBy,
++    updatedBy: row.updatedBy,
++    createdAt: row.createdAt?.toISOString() ?? new Date().toISOString(),
++    updatedAt: row.updatedAt?.toISOString() ?? new Date().toISOString(),
++  };
++}
++
++const annotationInputSchema = z.object({
++  node_id: z.string().describe('Target node id'),
++  severity: z.enum(['error', 'warning', 'suggestion']).describe('Annotation severity'),
++  title: z.string().describe('Short headline shown on the canvas card'),
++  description: z.string().describe('Full explanation of the issue'),
++  fix: z
++    .object({
++      description: z.string(),
++      tool: z.string(),
++      params: z.record(z.unknown()),
++    })
++    .optional()
++    .describe('Optional suggested one-click fix'),
++  related_nodes: z.array(z.string()).optional().describe('Other node ids this annotation references'),
++  knowledge_source: z.string().optional().describe('Knowledge-base rule id or source URL'),
++});
++
++/**
++ * Extracted module-level handlers so Fastify REST routes can call the same
++ * code path as the MCP tool callbacks (Story 2.3 Task 7). These return plain
++ * objects (NOT the MCP `{ content: [...] }` wrapper); the MCP callbacks wrap
++ * results + translate thrown errors into mcpError, while the REST layer
++ * translates thrown errors into 400 responses.
++ */
++export async function handleApplyFix(params: { workflow_id: string; annotation_id: string }): Promise<{
++  applied: true;
++  annotation_id: string;
++  tool: string;
++  result: unknown;
++}> {
++  const { workflow_id, annotation_id } = params;
++  const annotation = await annotationStore.getAnnotationById(annotation_id);
++  if (!annotation) throw new Error(`Annotation ${annotation_id} not found`);
++  if (annotation.workflowId !== workflow_id) {
++    throw new Error(`Annotation ${annotation_id} does not belong to workflow ${workflow_id}`);
++  }
++  if (annotation.status !== 'active') {
++    throw new Error(`Annotation ${annotation_id} is ${annotation.status} and cannot be applied`);
++  }
++  if (!annotation.fix) {
++    throw new Error(`Annotation ${annotation_id} has no fix`);
++  }
++
++  let result: unknown;
++  try {
++    result = await dispatchFix(annotation.fix.tool, {
++      ...annotation.fix.params,
++      workflow_id,
++    });
++  } catch (err) {
++    if (err instanceof UnknownFixToolError) {
++      throw new Error(`Unknown fix tool: ${err.toolName}`);
++    }
++    throw new Error(`Fix failed: ${(err as Error).message}`);
++  }
++
++  const applied = await annotationStore.applyAnnotation(workflow_id, annotation_id);
++  if (!applied) {
++    throw new Error(`Failed to mark annotation ${annotation_id} as applied`);
++  }
++
++  getBroadcaster()?.broadcast('annotation_applied', workflow_id, {
++    annotation_id,
++    workflow_id,
++    node_id: annotation.nodeId,
++    tool: annotation.fix.tool,
++    result,
++  });
++
++  return { applied: true, annotation_id, tool: annotation.fix.tool, result };
++}
++
++export async function handleDismissAnnotation(params: {
++  workflow_id: string;
++  annotation_id: string;
++  reason?: string;
++}): Promise<{ dismissed: true; annotation_id: string }> {
++  const { workflow_id, annotation_id, reason } = params;
++  const updated = await annotationStore.dismissAnnotation(workflow_id, annotation_id, reason);
++  if (!updated) {
++    throw new Error(`Annotation ${annotation_id} not found for workflow ${workflow_id}`);
++  }
++  const remaining = await annotationStore.getAnnotations(workflow_id, { status: 'active' });
++  getBroadcaster()?.broadcast('annotations_updated', workflow_id, {
++    annotations: remaining,
++    health_score: null,
++  });
++  return { dismissed: true, annotation_id };
++}
++
++export function registerReviewTools(server: McpServer) {
++  // ─── get_review_context ───────────────────────────────────
++  server.tool(
++    'flowaibuilder.get_review_context',
++    {
++      workflow_id: z.string().describe('Workflow id to build review context for'),
++    },
++    async ({ workflow_id }) => {
++      const [wf] = await db.select().from(workflows).where(eq(workflows.id, workflow_id));
++      if (!wf) return mcpError(`Workflow ${workflow_id} not found`);
++
++      const workflow = toWorkflow(wf);
++      const execs = await db
++        .select()
++        .from(executions)
++        .where(eq(executions.workflowId, workflow_id))
++        .orderBy(desc(executions.startedAt))
++        .limit(5);
++      const current = await annotationStore.getAnnotations(workflow_id, { status: 'active' });
++      const zones = await db
++        .select()
++        .from(protectedZones)
++        .where(eq(protectedZones.workflowId, workflow_id));
++
++      const context = buildReviewContext(workflow, execs, current, zones);
++      return {
++        content: [{ type: 'text' as const, text: JSON.stringify(context) }],
++      };
++    },
++  );
++
++  // ─── save_annotations ─────────────────────────────────────
++  server.tool(
++    'flowaibuilder.save_annotations',
++    {
++      workflow_id: z.string().describe('Workflow id'),
++      annotations: z.array(annotationInputSchema).describe('Annotations to persist'),
++      health_score: z
++        .number()
++        .min(0)
++        .max(100)
++        .optional()
++        .describe('Overall workflow health score 0-100'),
++      scores: z
++        .object({
++          security: z.number().min(0).max(25),
++          reliability: z.number().min(0).max(25),
++          data_integrity: z.number().min(0).max(25),
++          best_practices: z.number().min(0).max(25),
++        })
++        .optional()
++        .describe('Per-dimension scores, each 0-25 (sum 0-100)'),
++      summary: z.string().optional().describe('One-paragraph review summary'),
++    },
++    async ({ workflow_id, annotations: inputs, health_score, scores, summary }) => {
++      const [wf] = await db.select().from(workflows).where(eq(workflows.id, workflow_id));
++      if (!wf) return mcpError(`Workflow ${workflow_id} not found`);
++
++      const result = await annotationStore.saveAnnotations(
++        workflow_id,
++        inputs as AnnotationInput[],
++        {
++          healthScore: health_score,
++          scores: scores
++            ? {
++                security: scores.security,
++                reliability: scores.reliability,
++                dataIntegrity: scores.data_integrity,
++                bestPractices: scores.best_practices,
++              }
++            : undefined,
++          summary,
++        },
++      );
++
++      getBroadcaster()?.broadcast('annotations_updated', workflow_id, {
++        annotations: result.annotations,
++        health_score: result.healthScore,
++        scores: scores
++          ? {
++              security: scores.security,
++              reliability: scores.reliability,
++              data_integrity: scores.data_integrity,
++              best_practices: scores.best_practices,
++            }
++          : null,
++      });
++
++      return {
++        content: [
++          {
++            type: 'text' as const,
++            text: JSON.stringify({
++              saved: result.saved,
++              review_id: result.reviewId,
++              health_score: result.healthScore,
++            }),
++          },
++        ],
++      };
++    },
++  );
++
++  // ─── get_annotations ──────────────────────────────────────
++  server.tool(
++    'flowaibuilder.get_annotations',
++    {
++      workflow_id: z.string().describe('Workflow id'),
++      severity: z
++        .enum(['error', 'warning', 'suggestion'])
++        .optional()
++        .describe('Filter by severity'),
++      status: z
++        .enum(['active', 'applied', 'dismissed'])
++        .optional()
++        .describe('Filter by status (default: active)'),
++    },
++    async ({ workflow_id, severity, status }) => {
++      const list = await annotationStore.getAnnotations(workflow_id, { severity, status });
++      return {
++        content: [{ type: 'text' as const, text: JSON.stringify({ annotations: list }) }],
++      };
++    },
++  );
++
++  // ─── dismiss_annotation ───────────────────────────────────
++  server.tool(
++    'flowaibuilder.dismiss_annotation',
++    {
++      workflow_id: z.string().describe('Workflow id the annotation belongs to'),
++      annotation_id: z.string().describe('Annotation id to dismiss'),
++      reason: z.string().optional().describe('Optional dismiss reason'),
++    },
++    async ({ workflow_id, annotation_id, reason }) => {
++      try {
++        const result = await handleDismissAnnotation({ workflow_id, annotation_id, reason });
++        return {
++          content: [{ type: 'text' as const, text: JSON.stringify(result) }],
++        };
++      } catch (err) {
++        return mcpError((err as Error).message);
++      }
++    },
++  );
++
++  // ─── apply_fix ────────────────────────────────────────────
++  server.tool(
++    'flowaibuilder.apply_fix',
++    {
++      workflow_id: z.string().describe('Workflow id the annotation belongs to'),
++      annotation_id: z.string().describe('Annotation id whose fix should be applied'),
++    },
++    async ({ workflow_id, annotation_id }) => {
++      try {
++        const result = await handleApplyFix({ workflow_id, annotation_id });
++        return {
++          content: [{ type: 'text' as const, text: JSON.stringify(result) }],
++        };
++      } catch (err) {
++        return mcpError((err as Error).message);
++      }
++    },
++  );
++
++  // ─── get_health_score ─────────────────────────────────────
++  server.tool(
++    'flowaibuilder.get_health_score',
++    {
++      workflow_id: z.string().describe('Workflow id to read the latest health score for'),
++    },
++    async ({ workflow_id }) => {
++      const [wf] = await db.select().from(workflows).where(eq(workflows.id, workflow_id));
++      if (!wf) return mcpError(`Workflow ${workflow_id} not found`);
++
++      const latest = await annotationStore.getLatestReview(workflow_id);
++      if (!latest) {
++        return {
++          content: [
++            {
++              type: 'text' as const,
++              text: JSON.stringify({
++                health_score: null,
++                scores: null,
++                summary: null,
++                review_id: null,
++                review_type: null,
++                annotation_count: 0,
++                created_at: null,
++              }),
++            },
++          ],
++        };
++      }
++
++      const scores = latest.scores
++        ? {
++            security: latest.scores.security,
++            reliability: latest.scores.reliability,
++            data_integrity: latest.scores.dataIntegrity,
++            best_practices: latest.scores.bestPractices,
++          }
++        : null;
++
++      return {
++        content: [
++          {
++            type: 'text' as const,
++            text: JSON.stringify({
++              health_score: latest.healthScore,
++              scores,
++              summary: latest.summary,
++              review_id: latest.reviewId,
++              review_type: latest.reviewType,
++              annotation_count: latest.annotationCount,
++              created_at: latest.createdAt,
++            }),
++          },
++        ],
++      };
++    },
++  );
++}
+diff --git a/packages/ui/src/store/review.ts b/packages/ui/src/store/review.ts
+new file mode 100644
+index 0000000..88457cc
+--- /dev/null
++++ b/packages/ui/src/store/review.ts
+@@ -0,0 +1,156 @@
++import { create } from 'zustand';
++import type { Annotation, ReviewScores, WebSocketMessage } from '@flowaibuilder/shared';
++import {
++  getAnnotations,
++  getHealth,
++  applyAnnotationFix,
++  dismissAnnotation as apiDismissAnnotation,
++} from '../lib/api';
++
++interface ReviewState {
++  workflowId: string | null;
++  annotations: Annotation[];
++  healthScore: number | null;
++  scores: ReviewScores | null;
++  annotationCount: number;
++  loading: boolean;
++  error: string | null;
++  expandedAnnotationId: string | null;
++  panelOpen: boolean;
++
++  loadForWorkflow: (id: string) => Promise<void>;
++  clear: () => void;
++  applyFix: (annotationId: string) => Promise<void>;
++  dismiss: (annotationId: string, reason?: string) => Promise<void>;
++  setExpanded: (id: string | null) => void;
++  togglePanel: () => void;
++  applyWsMessage: (msg: WebSocketMessage) => void;
++}
++
++export const useReviewStore = create<ReviewState>()((set, get) => ({
++  workflowId: null,
++  annotations: [],
++  healthScore: null,
++  scores: null,
++  annotationCount: 0,
++  loading: false,
++  error: null,
++  expandedAnnotationId: null,
++  panelOpen: false,
++
++  loadForWorkflow: async (id: string) => {
++    set({ workflowId: id, loading: true, error: null });
++    try {
++      const [{ annotations }, health] = await Promise.all([
++        getAnnotations(id),
++        getHealth(id),
++      ]);
++      set({
++        annotations,
++        healthScore: health.healthScore,
++        scores: health.scores,
++        annotationCount: annotations.length,
++        loading: false,
++      });
++    } catch (err) {
++      set({
++        error: err instanceof Error ? err.message : 'Failed to load review data',
++        loading: false,
++      });
++    }
++  },
++
++  clear: () => {
++    set({
++      workflowId: null,
++      annotations: [],
++      healthScore: null,
++      scores: null,
++      annotationCount: 0,
++      loading: false,
++      error: null,
++      expandedAnnotationId: null,
++      panelOpen: false,
++    });
++  },
++
++  applyFix: async (annotationId: string) => {
++    const { workflowId, annotations } = get();
++    if (!workflowId) return;
++    const prev = annotations;
++    // Optimistic: mark as applied
++    set({
++      annotations: annotations.map((a) =>
++        a.id === annotationId ? { ...a, status: 'applied' as const } : a,
++      ),
++    });
++    try {
++      await applyAnnotationFix(workflowId, annotationId);
++    } catch (err) {
++      // Revert
++      set({
++        annotations: prev,
++        error: err instanceof Error ? err.message : 'Failed to apply fix',
++      });
++    }
++  },
++
++  dismiss: async (annotationId: string, reason?: string) => {
++    const { workflowId, annotations } = get();
++    if (!workflowId) return;
++    const prev = annotations;
++    set({
++      annotations: annotations.filter((a) => a.id !== annotationId),
++      annotationCount: Math.max(0, annotations.filter((a) => a.id !== annotationId).length),
++    });
++    try {
++      await apiDismissAnnotation(workflowId, annotationId, reason);
++    } catch (err) {
++      set({
++        annotations: prev,
++        annotationCount: prev.length,
++        error: err instanceof Error ? err.message : 'Failed to dismiss',
++      });
++    }
++  },
++
++  setExpanded: (id) => set({ expandedAnnotationId: id }),
++  togglePanel: () => set((s) => ({ panelOpen: !s.panelOpen })),
++
++  applyWsMessage: (msg: WebSocketMessage) => {
++    const { workflowId } = get();
++    if (!workflowId) return;
++    if (msg.workflowId && msg.workflowId !== workflowId) return;
++
++    switch (msg.type) {
++      case 'annotation_added': {
++        const data = msg.data as { annotation?: Annotation };
++        if (!data.annotation) return;
++        const { annotations } = get();
++        if (annotations.some((a) => a.id === data.annotation!.id)) return;
++        const next = [data.annotation, ...annotations];
++        set({ annotations: next, annotationCount: next.length });
++        return;
++      }
++      case 'annotation_applied': {
++        const data = msg.data as { annotation_id?: string };
++        if (!data.annotation_id) return;
++        const { annotations } = get();
++        set({
++          annotations: annotations.map((a) =>
++            a.id === data.annotation_id ? { ...a, status: 'applied' as const } : a,
++          ),
++        });
++        return;
++      }
++      case 'annotations_updated':
++      case 'review_completed': {
++        // Refetch to avoid snake/camel wire-shape coupling
++        void get().loadForWorkflow(workflowId);
++        return;
++      }
++      default:
++        return;
++    }
++  },
++}));
+diff --git a/packages/ui/src/components/canvas/review/AnnotationCard.tsx b/packages/ui/src/components/canvas/review/AnnotationCard.tsx
+new file mode 100644
+index 0000000..277ffb9
+--- /dev/null
++++ b/packages/ui/src/components/canvas/review/AnnotationCard.tsx
+@@ -0,0 +1,147 @@
++import { useState, type ReactElement } from 'react';
++import { AlertCircle, AlertTriangle, Lightbulb, X } from 'lucide-react';
++import type { Annotation } from '@flowaibuilder/shared';
++
++interface Props {
++  annotation: Annotation;
++  expanded: boolean;
++  onExpand: () => void;
++  onCollapse: () => void;
++  onApplyFix: () => void;
++  onDismiss: (reason?: string) => void;
++  onRelatedNodeClick?: (nodeId: string) => void;
++}
++
++const severityStyles: Record<Annotation['severity'], { wrap: string; icon: ReactElement }> = {
++  error: {
++    wrap: 'border-red-500 bg-red-500/10 text-red-300',
++    icon: <AlertCircle size={14} />,
++  },
++  warning: {
++    wrap: 'border-amber-500 bg-amber-500/10 text-amber-300',
++    icon: <AlertTriangle size={14} />,
++  },
++  suggestion: {
++    wrap: 'border-blue-500 bg-blue-500/10 text-blue-300',
++    icon: <Lightbulb size={14} />,
++  },
++};
++
++export function AnnotationCard({
++  annotation,
++  expanded,
++  onExpand,
++  onCollapse,
++  onApplyFix,
++  onDismiss,
++  onRelatedNodeClick,
++}: Props) {
++  const [dismissReason, setDismissReason] = useState('');
++  const [showReasonInput, setShowReasonInput] = useState(false);
++  const style = severityStyles[annotation.severity];
++  const isApplied = annotation.status === 'applied';
++
++  const titleClass = isApplied ? 'opacity-50 line-through' : '';
++
++  if (!expanded) {
++    return (
++      <button
++        type="button"
++        onClick={onExpand}
++        aria-label={`${annotation.severity}: ${annotation.title}`}
++        data-testid={`annotation-card-${annotation.id}`}
++        className={`flex items-center gap-1.5 rounded border px-2 py-1 text-xs max-w-[220px] truncate ${style.wrap} ${titleClass}`}
++      >
++        {style.icon}
++        <span className="truncate">{annotation.title}</span>
++      </button>
++    );
++  }
++
++  return (
++    <div
++      role="dialog"
++      aria-label={`${annotation.severity}: ${annotation.title}`}
++      data-testid={`annotation-card-${annotation.id}`}
++      className={`rounded border p-2 text-xs w-[260px] ${style.wrap}`}
++      onKeyDown={(e) => {
++        if (e.key === 'Escape') onCollapse();
++      }}
++    >
++      <div className="flex items-start justify-between gap-2">
++        <div className={`flex items-center gap-1.5 font-medium ${titleClass}`}>
++          {style.icon}
++          <span>{annotation.title}</span>
++        </div>
++        <button
++          type="button"
++          onClick={onCollapse}
++          aria-label="Close"
++          className="text-gray-400 hover:text-white"
++        >
++          <X size={12} />
++        </button>
++      </div>
++      <p className="mt-1 text-gray-300 whitespace-pre-wrap">{annotation.description}</p>
++
++      {annotation.relatedNodes && annotation.relatedNodes.length > 0 && (
++        <div className="mt-2">
++          <div className="text-[10px] uppercase tracking-wide text-gray-400 mb-1">Related nodes</div>
++          <div className="flex flex-wrap gap-1">
++            {annotation.relatedNodes.map((id) => (
++              <button
++                key={id}
++                type="button"
++                onClick={() => onRelatedNodeClick?.(id)}
++                className="px-1.5 py-0.5 rounded bg-gray-800 border border-gray-700 text-gray-300 text-[10px] hover:bg-gray-700"
++              >
++                {id}
++              </button>
++            ))}
++          </div>
++        </div>
++      )}
++
++      <div className="mt-2 flex items-center gap-1.5">
++        {annotation.fix && !isApplied && (
++          <button
++            type="button"
++            onClick={onApplyFix}
++            title={annotation.fix.description}
++            data-testid={`apply-fix-${annotation.id}`}
++            className="px-2 py-1 rounded bg-purple-600 text-white text-[10px] hover:bg-purple-700"
++          >
++            Apply Fix
++          </button>
++        )}
++        {showReasonInput ? (
++          <div className="flex items-center gap-1">
++            <input
++              type="text"
++              value={dismissReason}
++              onChange={(e) => setDismissReason(e.target.value)}
++              placeholder="Reason (optional)"
++              className="px-1 py-0.5 rounded bg-gray-800 border border-gray-700 text-[10px] w-28"
++            />
++            <button
++              type="button"
++              onClick={() => onDismiss(dismissReason || undefined)}
++              className="px-2 py-1 rounded bg-gray-700 text-gray-200 text-[10px] hover:bg-gray-600"
++            >
++              OK
++            </button>
++          </div>
++        ) : (
++          <button
++            type="button"
++            onClick={() => setShowReasonInput(true)}
++            data-testid={`dismiss-${annotation.id}`}
++            className="px-2 py-1 rounded bg-gray-700 text-gray-200 text-[10px] hover:bg-gray-600"
++          >
++            Dismiss
++          </button>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/packages/ui/src/components/canvas/review/AnnotationConnector.tsx b/packages/ui/src/components/canvas/review/AnnotationConnector.tsx
+new file mode 100644
+index 0000000..4a5c396
+--- /dev/null
++++ b/packages/ui/src/components/canvas/review/AnnotationConnector.tsx
+@@ -0,0 +1,36 @@
++interface Props {
++  from: { x: number; y: number };
++  to: { x: number; y: number };
++  severity: 'error' | 'warning' | 'suggestion';
++}
++
++const colorBySeverity: Record<Props['severity'], string> = {
++  error: '#ef4444',
++  warning: '#f59e0b',
++  suggestion: '#3b82f6',
++};
++
++export function AnnotationConnector({ from, to, severity }: Props) {
++  return (
++    <svg
++      style={{
++        position: 'absolute',
++        top: 0,
++        left: 0,
++        pointerEvents: 'none',
++        overflow: 'visible',
++      }}
++    >
++      <line
++        x1={from.x}
++        y1={from.y}
++        x2={to.x}
++        y2={to.y}
++        stroke={colorBySeverity[severity]}
++        strokeDasharray="3 2"
++        strokeWidth={1}
++        opacity={0.5}
++      />
++    </svg>
++  );
++}
+diff --git a/packages/ui/src/components/canvas/review/ReactFlowAnnotationLayer.tsx b/packages/ui/src/components/canvas/review/ReactFlowAnnotationLayer.tsx
+new file mode 100644
+index 0000000..930deb8
+--- /dev/null
++++ b/packages/ui/src/components/canvas/review/ReactFlowAnnotationLayer.tsx
+@@ -0,0 +1,92 @@
++import { useMemo } from 'react';
++import { useReactFlow, useStore } from '@xyflow/react';
++import type { Annotation } from '@flowaibuilder/shared';
++import { useReviewStore } from '../../../store/review';
++import { AnnotationCard } from './AnnotationCard';
++import { AnnotationConnector } from './AnnotationConnector';
++
++const CARD_OFFSET_X = 220;
++const CARD_GAP = 4;
++const CARD_HEIGHT = 32;
++const SEVERITY_ORDER: Record<Annotation['severity'], number> = {
++  error: 0,
++  warning: 1,
++  suggestion: 2,
++};
++
++export function ReactFlowAnnotationLayer() {
++  const annotations = useReviewStore((s) => s.annotations);
++  const expandedId = useReviewStore((s) => s.expandedAnnotationId);
++  const setExpanded = useReviewStore((s) => s.setExpanded);
++  const applyFix = useReviewStore((s) => s.applyFix);
++  const dismiss = useReviewStore((s) => s.dismiss);
++  const { getNode, setCenter } = useReactFlow();
++  // Re-render on viewport changes so overlay pans/zooms with canvas
++  const viewport = useStore((s) => s.transform);
++
++  const grouped = useMemo(() => {
++    const by = new Map<string, Annotation[]>();
++    for (const a of annotations) {
++      const list = by.get(a.nodeId) ?? [];
++      list.push(a);
++      by.set(a.nodeId, list);
++    }
++    for (const list of by.values()) {
++      list.sort((a, b) => SEVERITY_ORDER[a.severity] - SEVERITY_ORDER[b.severity]);
++    }
++    return by;
++  }, [annotations]);
++
++  const [tx, ty, zoom] = viewport;
++
++  return (
++    <div
++      data-testid="annotation-layer"
++      style={{
++        position: 'absolute',
++        inset: 0,
++        pointerEvents: 'none',
++        zIndex: 5,
++      }}
++    >
++      {Array.from(grouped.entries()).map(([nodeId, list]) => {
++        const node = getNode(nodeId);
++        if (!node) return null;
++        const baseX = node.position.x * zoom + tx + CARD_OFFSET_X * zoom;
++        const baseY = node.position.y * zoom + ty;
++        return list.map((ann, i) => {
++          const yOff = baseY + i * (CARD_HEIGHT + CARD_GAP);
++          return (
++            <div key={ann.id}>
++              <AnnotationConnector
++                from={{ x: node.position.x * zoom + tx + 120 * zoom, y: baseY + CARD_HEIGHT / 2 }}
++                to={{ x: baseX, y: yOff + CARD_HEIGHT / 2 }}
++                severity={ann.severity}
++              />
++              <div
++                style={{
++                  position: 'absolute',
++                  transform: `translate(${baseX}px, ${yOff}px)`,
++                  pointerEvents: 'auto',
++                }}
++              >
++                <AnnotationCard
++                  annotation={ann}
++                  expanded={expandedId === ann.id}
++                  onExpand={() => setExpanded(ann.id)}
++                  onCollapse={() => setExpanded(null)}
++                  onApplyFix={() => void applyFix(ann.id)}
++                  onDismiss={(reason) => void dismiss(ann.id, reason)}
++                  onRelatedNodeClick={(id) => {
++                    const n = getNode(id);
++                    if (n) setCenter(n.position.x, n.position.y, { zoom: 1.2, duration: 200 });
++                  }}
++                />
++              </div>
++            </div>
++          );
++        });
++      })}
++    </div>
++  );
++}
+diff --git a/packages/ui/src/components/canvas/review/ReviewPanel.tsx b/packages/ui/src/components/canvas/review/ReviewPanel.tsx
+new file mode 100644
+index 0000000..01cf736
+--- /dev/null
++++ b/packages/ui/src/components/canvas/review/ReviewPanel.tsx
+@@ -0,0 +1,73 @@
++import { useMemo } from 'react';
++import { useReactFlow } from '@xyflow/react';
++import type { Annotation } from '@flowaibuilder/shared';
++import { X } from 'lucide-react';
++import { useReviewStore } from '../../../store/review';
++
++const SEVERITY_ORDER: Annotation['severity'][] = ['error', 'warning', 'suggestion'];
++
++export function ReviewPanel() {
++  const open = useReviewStore((s) => s.panelOpen);
++  const togglePanel = useReviewStore((s) => s.togglePanel);
++  const annotations = useReviewStore((s) => s.annotations);
++  const setExpanded = useReviewStore((s) => s.setExpanded);
++  const { getNode, setCenter } = useReactFlow();
++
++  const grouped = useMemo(() => {
++    const g: Record<Annotation['severity'], Annotation[]> = {
++      error: [],
++      warning: [],
++      suggestion: [],
++    };
++    for (const a of annotations) g[a.severity].push(a);
++    return g;
++  }, [annotations]);
++
++  if (!open) return null;
++
++  return (
++    <div
++      data-testid="review-panel"
++      className="absolute top-0 right-0 h-full w-80 bg-gray-900 border-l border-gray-800 z-20 flex flex-col"
++    >
++      <div className="flex items-center justify-between px-3 py-2 border-b border-gray-800">
++        <h3 className="text-sm font-semibold text-white">Review ({annotations.length})</h3>
++        <button onClick={togglePanel} aria-label="Close review panel" className="text-gray-400 hover:text-white">
++          <X size={14} />
++        </button>
++      </div>
++      <div className="flex-1 overflow-auto p-2 space-y-3">
++        {SEVERITY_ORDER.map((sev) => {
++          const list = grouped[sev];
++          if (list.length === 0) return null;
++          return (
++            <div key={sev}>
++              <div className="text-[10px] uppercase tracking-wide text-gray-500 mb-1 px-1">{sev}</div>
++              <div className="space-y-1">
++                {list.map((a) => (
++                  <button
++                    key={a.id}
++                    type="button"
++                    onClick={() => {
++                      setExpanded(a.id);
++                      const n = getNode(a.nodeId);
++                      if (n) setCenter(n.position.x, n.position.y, { zoom: 1.2, duration: 200 });
++                    }}
++                    className="block w-full text-left px-2 py-1.5 rounded bg-gray-800 hover:bg-gray-700 text-xs"
++                  >
++                    <div className="text-white font-medium truncate">{a.title}</div>
++                    <div className="text-gray-400 truncate">{a.description}</div>
++                    <div className="text-gray-500 text-[10px] mt-0.5">node: {a.nodeId}</div>
++                  </button>
++                ))}
++              </div>
++            </div>
++          );
++        })}
++        {annotations.length === 0 && (
++          <div className="text-xs text-gray-500 text-center mt-8">No active annotations</div>
++        )}
++      </div>
++    </div>
++  );
++}
+diff --git a/packages/ui/src/__tests__/review-store.test.ts b/packages/ui/src/__tests__/review-store.test.ts
+new file mode 100644
+index 0000000..8beec08
+--- /dev/null
++++ b/packages/ui/src/__tests__/review-store.test.ts
+@@ -0,0 +1,111 @@
++import { describe, it, expect, vi, beforeEach } from 'vitest';
++import type { Annotation } from '@flowaibuilder/shared';
++
++vi.mock('../lib/api', () => ({
++  getAnnotations: vi.fn(),
++  getHealth: vi.fn(),
++  applyAnnotationFix: vi.fn(),
++  dismissAnnotation: vi.fn(),
++}));
++
++import * as api from '../lib/api';
++import { useReviewStore } from '../store/review';
++
++const WF_ID = 'wf-1';
++
++function makeAnnotation(id: string, overrides: Partial<Annotation> = {}): Annotation {
++  return {
++    id,
++    workflowId: WF_ID,
++    nodeId: 'n1',
++    severity: 'error',
++    title: `title-${id}`,
++    description: 'desc',
++    status: 'active',
++    createdAt: new Date().toISOString(),
++    ...overrides,
++  };
++}
++
++beforeEach(() => {
++  vi.clearAllMocks();
++  useReviewStore.getState().clear();
++});
++
++describe('useReviewStore', () => {
++  it('loadForWorkflow populates annotations and health in parallel', async () => {
++    (api.getAnnotations as ReturnType<typeof vi.fn>).mockResolvedValue({
++      annotations: [makeAnnotation('a1'), makeAnnotation('a2')],
++    });
++    (api.getHealth as ReturnType<typeof vi.fn>).mockResolvedValue({
++      healthScore: 82, scores: null, summary: null,
++      reviewId: 'r1', reviewType: 'ai', annotationCount: 2, createdAt: null,
++    });
++    await useReviewStore.getState().loadForWorkflow(WF_ID);
++    const s = useReviewStore.getState();
++    expect(s.annotations).toHaveLength(2);
++    expect(s.healthScore).toBe(82);
++    expect(s.annotationCount).toBe(2);
++    expect(s.loading).toBe(false);
++  });
++
++  it('loadForWorkflow sets error on failure', async () => {
++    (api.getAnnotations as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('boom'));
++    (api.getHealth as ReturnType<typeof vi.fn>).mockResolvedValue({
++      healthScore: null, scores: null, summary: null,
++      reviewId: null, reviewType: null, annotationCount: 0, createdAt: null,
++    });
++    await useReviewStore.getState().loadForWorkflow(WF_ID);
++    expect(useReviewStore.getState().error).toBe('boom');
++  });
++
++  it('applyFix optimistically flips status and reverts on error', async () => {
++    (api.getAnnotations as ReturnType<typeof vi.fn>).mockResolvedValue({
++      annotations: [makeAnnotation('a1')],
++    });
++    (api.getHealth as ReturnType<typeof vi.fn>).mockResolvedValue({
++      healthScore: null, scores: null, summary: null,
++      reviewId: null, reviewType: null, annotationCount: 1, createdAt: null,
++    });
++    await useReviewStore.getState().loadForWorkflow(WF_ID);
++
++    (api.applyAnnotationFix as ReturnType<typeof vi.fn>).mockRejectedValue(new Error('no'));
++    await useReviewStore.getState().applyFix('a1');
++    const s = useReviewStore.getState();
++    expect(s.annotations[0].status).toBe('active'); // reverted
++    expect(s.error).toBe('no');
++  });
++
++  it('applyWsMessage handles annotation_added', () => {
++    useReviewStore.setState({ workflowId: WF_ID, annotations: [] });
++    useReviewStore.getState().applyWsMessage({
++      type: 'annotation_added',
++      workflowId: WF_ID,
++      data: { annotation: makeAnnotation('a9') },
++      timestamp: new Date().toISOString(),
++    });
++    expect(useReviewStore.getState().annotations).toHaveLength(1);
++  });
++
++  it('applyWsMessage ignores events for other workflows', () => {
++    useReviewStore.setState({ workflowId: WF_ID, annotations: [] });
++    useReviewStore.getState().applyWsMessage({
++      type: 'annotation_added',
++      workflowId: 'other',
++      data: { annotation: makeAnnotation('a9') },
++      timestamp: new Date().toISOString(),
++    });
++    expect(useReviewStore.getState().annotations).toHaveLength(0);
++  });
++
++  it('applyWsMessage on annotation_applied marks status=applied', () => {
++    useReviewStore.setState({ workflowId: WF_ID, annotations: [makeAnnotation('a1')] });
++    useReviewStore.getState().applyWsMessage({
++      type: 'annotation_applied',
++      workflowId: WF_ID,
++      data: { annotation_id: 'a1' },
++      timestamp: new Date().toISOString(),
++    });
++    expect(useReviewStore.getState().annotations[0].status).toBe('applied');
++  });
++});
+diff --git a/packages/ui/src/__tests__/annotation-card.test.tsx b/packages/ui/src/__tests__/annotation-card.test.tsx
+new file mode 100644
+index 0000000..0cbd68d
+--- /dev/null
++++ b/packages/ui/src/__tests__/annotation-card.test.tsx
+@@ -0,0 +1,103 @@
++import { describe, it, expect, vi } from 'vitest';
++import { render, screen, fireEvent } from '@testing-library/react';
++import type { Annotation } from '@flowaibuilder/shared';
++import { AnnotationCard } from '../components/canvas/review/AnnotationCard';
++
++function makeAnnotation(overrides: Partial<Annotation> = {}): Annotation {
++  return {
++    id: 'a1',
++    workflowId: 'wf-1',
++    nodeId: 'n1',
++    severity: 'error',
++    title: 'Missing credential',
++    description: 'This node has no credential configured.',
++    status: 'active',
++    createdAt: new Date().toISOString(),
++    ...overrides,
++  };
++}
++
++describe('<AnnotationCard />', () => {
++  it('renders collapsed badge with severity-prefixed aria-label', () => {
++    const ann = makeAnnotation();
++    render(
++      <AnnotationCard
++        annotation={ann}
++        expanded={false}
++        onExpand={vi.fn()}
++        onCollapse={vi.fn()}
++        onApplyFix={vi.fn()}
++        onDismiss={vi.fn()}
++      />,
++    );
++    expect(screen.getByLabelText('error: Missing credential')).toBeInTheDocument();
++  });
++
++  it.each(['error', 'warning', 'suggestion'] as const)(
++    'renders severity %s',
++    (severity) => {
++      const ann = makeAnnotation({ severity, title: `${severity}-title` });
++      render(
++        <AnnotationCard
++          annotation={ann}
++          expanded={false}
++          onExpand={vi.fn()}
++          onCollapse={vi.fn()}
++          onApplyFix={vi.fn()}
++          onDismiss={vi.fn()}
++        />,
++      );
++      expect(screen.getByLabelText(`${severity}: ${severity}-title`)).toBeInTheDocument();
++    },
++  );
++
++  it('hides Apply Fix button when annotation.fix is absent', () => {
++    const ann = makeAnnotation();
++    render(
++      <AnnotationCard
++        annotation={ann}
++        expanded={true}
++        onExpand={vi.fn()}
++        onCollapse={vi.fn()}
++        onApplyFix={vi.fn()}
++        onDismiss={vi.fn()}
++      />,
++    );
++    expect(screen.queryByTestId('apply-fix-a1')).toBeNull();
++  });
++
++  it('shows Apply Fix button and calls handler when fix is present', () => {
++    const ann = makeAnnotation({
++      fix: { tool: 'update_node', params: {}, description: 'Add credential' },
++    });
++    const onApplyFix = vi.fn();
++    render(
++      <AnnotationCard
++        annotation={ann}
++        expanded={true}
++        onExpand={vi.fn()}
++        onCollapse={vi.fn()}
++        onApplyFix={onApplyFix}
++        onDismiss={vi.fn()}
++      />,
++    );
++    fireEvent.click(screen.getByTestId('apply-fix-a1'));
++    expect(onApplyFix).toHaveBeenCalled();
++  });
++
++  it('calls onExpand when collapsed card is clicked', () => {
++    const onExpand = vi.fn();
++    render(
++      <AnnotationCard
++        annotation={makeAnnotation()}
++        expanded={false}
++        onExpand={onExpand}
++        onCollapse={vi.fn()}
++        onApplyFix={vi.fn()}
++        onDismiss={vi.fn()}
++      />,
++    );
++    fireEvent.click(screen.getByTestId('annotation-card-a1'));
++    expect(onExpand).toHaveBeenCalled();
++  });
++});
+diff --git a/packages/ui/src/__tests__/canvas-toolbar.test.ts b/packages/ui/src/__tests__/canvas-toolbar.test.ts
+new file mode 100644
+index 0000000..176d70f
+--- /dev/null
++++ b/packages/ui/src/__tests__/canvas-toolbar.test.ts
+@@ -0,0 +1,135 @@
++import { describe, it, expect, vi, beforeEach } from 'vitest';
++import { render, screen, fireEvent, waitFor } from '@testing-library/react';
++import { createElement } from 'react';
++import { CanvasToolbar } from '../components/toolbar/CanvasToolbar';
++import { AddNodeDropdown } from '../components/toolbar/AddNodeDropdown';
++import { NODE_CATEGORIES } from '@flowaibuilder/shared';
++
++// Mock react-router-dom
++vi.mock('react-router-dom', () => ({
++  useNavigate: () => vi.fn(),
++}));
++
++// Mock zustand store
++vi.mock('../store/workflow', () => ({
++  useWorkflowStore: vi.fn((selector: (s: unknown) => unknown) =>
++    selector({ addNode: mockAddNode, workflow: { id: 'wf-1' } }),
++  ),
++}));
++
++// Mock execution + ui stores (toolbar reads from them)
++vi.mock('../store/execution', () => ({
++  useExecutionStore: Object.assign(
++    (selector: (s: unknown) => unknown) => selector({
++      status: null, durationMs: null, clearExecution: () => {},
++    }),
++    { getState: () => ({ status: null, setFullExecutionData: () => {}, clearExecution: () => {} }), setState: () => {} },
++  ),
++}));
++vi.mock('../store/ui', () => ({
++  useUiStore: (selector: (s: unknown) => unknown) => selector({
++    jsonPanelOpen: false,
++    toggleJsonPanel: () => {},
++  }),
++}));
++
++// Mock api (executeWorkflow + requestReview)
++vi.mock('../lib/api', () => ({
++  executeWorkflow: vi.fn().mockResolvedValue({ id: 'e1', nodeExecutions: [] }),
++  requestReview: vi.fn().mockResolvedValue({ prompt: 'Review workflow wf-1.' }),
++}));
++
++// Mock icons
++vi.mock('../../lib/icons', () => ({
++  resolveIcon: vi.fn(() => {
++    return function MockIcon(props: Record<string, unknown>) {
++      return createElement('svg', { 'data-testid': 'icon', ...props });
++    };
++  }),
++}));
++
++const mockAddNode = vi.fn().mockResolvedValue(undefined);
++
++describe('CanvasToolbar', () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++  });
++
++  it('renders Add Node button', () => {
++    render(createElement(CanvasToolbar));
++    expect(screen.getByText('Add Node')).toBeDefined();
++  });
++
++  it('opens dropdown on click', () => {
++    render(createElement(CanvasToolbar));
++    fireEvent.click(screen.getByText('Add Node'));
++
++    // Should show category headers
++    for (const cat of Object.values(NODE_CATEGORIES)) {
++      expect(screen.getByText(cat.label)).toBeDefined();
++    }
++  });
++
++  it('clicking AI Review button calls requestReview and writes prompt to clipboard', async () => {
++    const writeText = vi.fn().mockResolvedValue(undefined);
++    Object.assign(navigator, { clipboard: { writeText } });
++    const api = await import('../lib/api');
++    render(createElement(CanvasToolbar));
++    fireEvent.click(screen.getByTestId('ai-review-button'));
++    await waitFor(() => {
++      expect(api.requestReview).toHaveBeenCalledWith('wf-1');
++      expect(writeText).toHaveBeenCalledWith('Review workflow wf-1.');
++      expect(screen.getByTestId('ai-review-status')).toBeDefined();
++    });
++  });
++
++  it('closes dropdown after selecting a node type', async () => {
++    render(createElement(CanvasToolbar));
++    fireEvent.click(screen.getByText('Add Node'));
++
++    // Click a node type
++    fireEvent.click(screen.getByText('Webhook'));
++
++    expect(mockAddNode).toHaveBeenCalledWith('webhook', 'Webhook');
++
++    // Dropdown should close — category headers should no longer be visible
++    await waitFor(() => {
++      expect(screen.queryByText('Triggers')).toBeNull();
++    });
++  });
++});
++
++describe('AddNodeDropdown', () => {
++  beforeEach(() => {
++    vi.clearAllMocks();
++  });
++
++  it('renders all category headers', () => {
++    const onSelect = vi.fn();
++    const onClose = vi.fn();
++    render(createElement(AddNodeDropdown, { onSelect, onClose }));
++
++    for (const cat of Object.values(NODE_CATEGORIES)) {
++      expect(screen.getByText(cat.label)).toBeDefined();
++    }
++  });
++
++  it('calls onSelect with type and label on click', () => {
++    const onSelect = vi.fn();
++    const onClose = vi.fn();
++    render(createElement(AddNodeDropdown, { onSelect, onClose }));
++
++    fireEvent.click(screen.getByText('HTTP Request'));
++    expect(onSelect).toHaveBeenCalledWith('http-request', 'HTTP Request');
++    expect(onClose).toHaveBeenCalled();
++  });
++
++  it('closes on outside click', () => {
++    const onClose = vi.fn();
++    render(createElement(AddNodeDropdown, { onSelect: vi.fn(), onClose }));
++
++    // Click outside the dropdown
++    fireEvent.mouseDown(document.body);
++    expect(onClose).toHaveBeenCalled();
++  });
++});
+diff --git a/packages/server/src/__tests__/review-rest.test.ts b/packages/server/src/__tests__/review-rest.test.ts
+new file mode 100644
+index 0000000..7808890
+--- /dev/null
++++ b/packages/server/src/__tests__/review-rest.test.ts
+@@ -0,0 +1,290 @@
++import { describe, it, expect, vi, beforeEach } from 'vitest';
++import Fastify from 'fastify';
++
++// ─── DB mock (mirrors review-mcp.test.ts) ─────────────────
++type Row = Record<string, unknown>;
++const state: {
++  annotations: Row[];
++  workflowReviews: Row[];
++  workflows: Row[];
++  executions: Row[];
++  protectedZones: Row[];
++} = {
++  annotations: [],
++  workflowReviews: [],
++  workflows: [],
++  executions: [],
++  protectedZones: [],
++};
++
++function resetState() {
++  state.annotations = [];
++  state.workflowReviews = [];
++  state.workflows = [];
++  state.executions = [];
++  state.protectedZones = [];
++}
++
++vi.mock('drizzle-orm', () => ({
++  eq: (col: { _col: string; _table: string }, val: unknown) => ({ kind: 'eq', col: col._col, table: col._table, val }),
++  and: (...conds: unknown[]) => ({ kind: 'and', conds }),
++  desc: (col: { _col: string }) => ({ kind: 'desc', col: col._col }),
++}));
++
++vi.mock('../db/schema.js', () => {
++  const mk = (table: string, cols: string[]) => {
++    const out: Record<string, unknown> = { _table: table, $inferSelect: {} };
++    for (const c of cols) out[c] = { _col: c, _table: table };
++    return out;
++  };
++  return {
++    workflows: mk('workflows', ['id', 'workflowId']),
++    executions: mk('executions', ['workflowId']),
++    annotations: mk('annotations', ['id', 'workflowId', 'status', 'severity', 'createdAt']),
++    workflowReviews: mk('workflowReviews', ['id', 'workflowId', 'createdAt']),
++    protectedZones: mk('protectedZones', ['id', 'workflowId']),
++  };
++});
++
++function tableNameFromArg(arg: unknown): string {
++  return (arg as { _table?: string })?._table ?? '';
++}
++
++function matchesFilter(row: Row, filter: unknown): boolean {
++  if (!filter) return true;
++  const f = filter as { kind: string; conds?: unknown[]; col?: string; val?: unknown };
++  if (f.kind === 'and') return (f.conds ?? []).every((c) => matchesFilter(row, c));
++  if (f.kind === 'eq') return row[f.col as string] === f.val;
++  return true;
++}
++
++vi.mock('../db/index.js', () => {
++  function selectChain(pool: () => Row[]) {
++    let filter: unknown;
++    const chain: Record<string, unknown> = {
++      where: vi.fn((f: unknown) => {
++        filter = f;
++        return chain;
++      }),
++      orderBy: vi.fn(() => chain),
++      limit: vi.fn(async () => pool().filter((r) => matchesFilter(r, filter))),
++      then: (resolve: (v: Row[]) => void) => resolve(pool().filter((r) => matchesFilter(r, filter))),
++    };
++    return chain;
++  }
++  const db = {
++    select: vi.fn(() => ({
++      from: vi.fn((table: unknown) => {
++        const name = tableNameFromArg(table);
++        return selectChain(() => (state[name as keyof typeof state] as Row[]) ?? []);
++      }),
++    })),
++    insert: vi.fn((table: unknown) => {
++      const name = tableNameFromArg(table);
++      return {
++        values: vi.fn((vals: Row | Row[]) => ({
++          returning: vi.fn(async () => {
++            const list = Array.isArray(vals) ? vals : [vals];
++            const stamped = list.map((v, i) => ({
++              id: v.id ?? `${name}-${(state[name as keyof typeof state] as Row[]).length + i + 1}`,
++              createdAt: new Date(),
++              ...v,
++            }));
++            (state[name as keyof typeof state] as Row[]).push(...stamped);
++            return stamped;
++          }),
++        })),
++      };
++    }),
++    update: vi.fn((table: unknown) => {
++      const name = tableNameFromArg(table);
++      return {
++        set: vi.fn((patch: Row) => ({
++          where: vi.fn((filter: unknown) => ({
++            returning: vi.fn(async () => {
++              const rows = (state[name as keyof typeof state] as Row[]).filter((r) =>
++                matchesFilter(r, filter),
++              );
++              for (const r of rows) Object.assign(r, patch);
++              return rows;
++            }),
++          })),
++        })),
++      };
++    }),
++  };
++  return { db };
++});
++
++const broadcastSpy = vi.fn();
++vi.mock('../api/ws/broadcaster.js', () => ({
++  getBroadcaster: () => ({ broadcast: broadcastSpy, broadcastToWorkflow: vi.fn() }),
++}));
++
++// Stub fix-dispatcher so apply_fix doesn't need a real fix tool registry
++vi.mock('../review/fix-dispatcher.js', () => ({
++  dispatchFix: vi.fn(async () => ({ ok: true })),
++  UnknownFixToolError: class extends Error {
++    toolName: string;
++    constructor(name: string) {
++      super(name);
++      this.toolName = name;
++    }
++  },
++}));
++
++import { registerReviewRoutes } from '../api/routes/review.js';
++
++const WF_ID = 'wf-1';
++
++beforeEach(() => {
++  resetState();
++  broadcastSpy.mockClear();
++});
++
++async function buildApp() {
++  const app = Fastify({ logger: false });
++  app.setErrorHandler((err, _req, reply) => {
++    // eslint-disable-next-line no-console
++    console.error('ROUTE ERROR:', err);
++    reply.code(500).send({ error: err.message });
++  });
++  await registerReviewRoutes(app);
++  return app;
++}
++
++describe('review REST routes', () => {
++  it('GET /annotations returns 404 on unknown workflow', async () => {
++    const app = await buildApp();
++    const res = await app.inject({ method: 'GET', url: `/api/workflows/missing/annotations` });
++    expect(res.statusCode).toBe(404);
++  });
++
++  it('GET /annotations returns active annotations', async () => {
++    state.workflows.push({ id: WF_ID });
++    state.annotations.push({
++      id: 'a1', workflowId: WF_ID, nodeId: 'n1', severity: 'error',
++      title: 't', description: 'd', status: 'active', createdAt: new Date(),
++    });
++    const app = await buildApp();
++    const res = await app.inject({ method: 'GET', url: `/api/workflows/${WF_ID}/annotations` });
++    expect(res.statusCode).toBe(200);
++    const body = res.json();
++    expect(body.annotations).toHaveLength(1);
++    expect(body.annotations[0].id).toBe('a1');
++  });
++
++  it('GET /health returns nulls when no review exists', async () => {
++    state.workflows.push({ id: WF_ID });
++    const app = await buildApp();
++    const res = await app.inject({ method: 'GET', url: `/api/workflows/${WF_ID}/health` });
++    expect(res.statusCode).toBe(200);
++    const body = res.json();
++    expect(body.healthScore).toBeNull();
++    expect(body.annotationCount).toBe(0);
++  });
++
++  it('GET /health returns camelCase health data when a review exists', async () => {
++    state.workflows.push({ id: WF_ID });
++    state.workflowReviews.push({
++      id: 'r1', workflowId: WF_ID, reviewType: 'ai',
++      healthScore: 82,
++      scores: { security: 20, reliability: 20, dataIntegrity: 22, bestPractices: 20 },
++      summary: 'ok', annotationCount: 3,
++      createdAt: new Date(),
++    });
++    const app = await buildApp();
++    const res = await app.inject({ method: 'GET', url: `/api/workflows/${WF_ID}/health` });
++    expect(res.statusCode).toBe(200);
++    const body = res.json();
++    expect(body.healthScore).toBe(82);
++    expect(body.scores.dataIntegrity).toBe(22);
++    expect(body.annotationCount).toBe(3);
++  });
++
++  it('POST /apply flips annotation status to applied and broadcasts', async () => {
++    state.workflows.push({ id: WF_ID });
++    state.annotations.push({
++      id: 'a1', workflowId: WF_ID, nodeId: 'n1', severity: 'error',
++      title: 't', description: 'd', status: 'active',
++      fix: { tool: 'update_node', params: { node_id: 'n1' }, description: 'fix' },
++      createdAt: new Date(),
++    });
++    const app = await buildApp();
++    const res = await app.inject({
++      method: 'POST',
++      url: `/api/workflows/${WF_ID}/annotations/a1/apply`,
++    });
++    expect(res.statusCode).toBe(200);
++    const body = res.json();
++    expect(body.applied).toBe(true);
++    expect(body.annotation_id).toBe('a1');
++    expect(state.annotations[0].status).toBe('applied');
++    expect(broadcastSpy).toHaveBeenCalledWith('annotation_applied', WF_ID, expect.any(Object));
++  });
++
++  it('POST /apply returns 400 when annotation has no fix', async () => {
++    state.workflows.push({ id: WF_ID });
++    state.annotations.push({
++      id: 'a2', workflowId: WF_ID, nodeId: 'n1', severity: 'warning',
++      title: 't', description: 'd', status: 'active', createdAt: new Date(),
++    });
++    const app = await buildApp();
++    const res = await app.inject({
++      method: 'POST',
++      url: `/api/workflows/${WF_ID}/annotations/a2/apply`,
++    });
++    expect(res.statusCode).toBe(400);
++  });
++
++  it('POST /dismiss flips status and broadcasts annotations_updated', async () => {
++    state.workflows.push({ id: WF_ID });
++    state.annotations.push({
++      id: 'a3', workflowId: WF_ID, nodeId: 'n1', severity: 'warning',
++      title: 't', description: 'd', status: 'active', createdAt: new Date(),
++    });
++    const app = await buildApp();
++    const res = await app.inject({
++      method: 'POST',
++      url: `/api/workflows/${WF_ID}/annotations/a3/dismiss`,
++      payload: { reason: 'false positive' },
++    });
++    expect(res.statusCode).toBe(200);
++    expect(res.json().dismissed).toBe(true);
++    expect(state.annotations[0].status).toBe('dismissed');
++    expect(state.annotations[0].dismissedReason).toBe('false positive');
++    expect(broadcastSpy).toHaveBeenCalledWith('annotations_updated', WF_ID, expect.any(Object));
++  });
++
++  it('POST /review/request broadcasts and returns prompt', async () => {
++    state.workflows.push({ id: WF_ID });
++    const app = await buildApp();
++    const res = await app.inject({
++      method: 'POST',
++      url: `/api/workflows/${WF_ID}/review/request`,
++    });
++    expect(res.statusCode).toBe(200);
++    const body = res.json();
++    expect(body.prompt).toContain(WF_ID);
++    expect(broadcastSpy).toHaveBeenCalledWith('review_requested', WF_ID, expect.any(Object));
++  });
++
++  it('POST /review/request returns 404 on unknown workflow', async () => {
++    const app = await buildApp();
++    const res = await app.inject({
++      method: 'POST',
++      url: `/api/workflows/missing/review/request`,
++    });
++    expect(res.statusCode).toBe(404);
++  });
++});
++
++describe('zero-cost AI invariant', () => {
++  it('review route file does not import @anthropic-ai/sdk', async () => {
++    const fs = await import('node:fs/promises');
++    const url = new URL('../api/routes/review.ts', import.meta.url);
++    const src = await fs.readFile(url, 'utf8');
++    expect(src).not.toContain('@anthropic-ai/sdk');
++    expect(src.toLowerCase()).not.toContain('openai');
++  });
++});

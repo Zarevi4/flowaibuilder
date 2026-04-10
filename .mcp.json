@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "flowaibuilder": {
+      "url": "http://localhost:5173/mcp/sse"
+    }
+  }
+}

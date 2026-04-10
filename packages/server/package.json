@@ -7,13 +7,19 @@
     "dev": "tsx watch src/index.ts",
     "build": "tsup src/index.ts --format esm --dts",
     "start": "node dist/index.js",
+    "test": "vitest run",
+    "test:watch": "vitest",
     "db:push": "drizzle-kit push",
     "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.700.0",
+    "@fastify/cookie": "^11.0.0",
     "@fastify/cors": "^10.0.0",
     "@fastify/websocket": "^11.0.0",
+    "@node-saml/node-saml": "^5.0.0",
+    "ldapts": "^7.0.0",
     "@flowaibuilder/shared": "*",
     "@modelcontextprotocol/sdk": "^1.27.1",
     "bullmq": "^5.30.0",
@@ -21,6 +27,7 @@
     "drizzle-orm": "^0.38.0",
     "fastify": "^5.2.0",
     "ioredis": "^5.4.0",
+    "isomorphic-git": "^1.27.0",
     "nanoid": "^5.0.0",
     "postgres": "^3.4.0",
     "ws": "^8.18.0",
@@ -32,6 +39,7 @@
     "drizzle-kit": "^0.30.0",
     "tsup": "^8.3.0",
     "tsx": "^4.19.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^4.1.1"
   }
 }

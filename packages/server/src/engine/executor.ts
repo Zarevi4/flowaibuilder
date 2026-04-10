@@ -1,8 +1,10 @@
 import { eq } from 'drizzle-orm';
 import { db } from '../db/index.js';
-import { executions } from '../db/schema.js';
+import { executions, credentials } from '../db/schema.js';
 import { createNodeContext } from './context.js';
 import { runNode } from './node-runner.js';
+import { getBroadcaster } from '../api/ws/broadcaster.js';
+import { decrypt } from '../crypto/aes.js';
 import type {
   Workflow,
   WorkflowNode,
@@ -12,6 +14,7 @@ import type {
   ExecutionStatus,
   ExecutionMode,
 } from '@flowaibuilder/shared';
+import { getLogStreamer } from '../logging/index.js';
 
 export class WorkflowExecutor {
   /**
@@ -22,34 +25,74 @@ export class WorkflowExecutor {
     triggerData?: unknown,
     mode: ExecutionMode = 'manual',
     triggeredBy: string = 'system',
+    existingExecutionId?: string,
   ): Promise<Execution> {
-    // 1. Create execution record
+    // 1. Create or reuse execution record
     const startedAt = new Date();
-    const [execRecord] = await db
-      .insert(executions)
-      .values({
-        workflowId: workflow.id,
-        workflowVersion: workflow.version,
-        status: 'running',
-        mode,
-        triggerData: triggerData ?? null,
-        triggeredBy,
-        startedAt,
-      })
-      .returning();
+    let execRecord: typeof executions.$inferSelect;
+
+    if (existingExecutionId) {
+      // Queue mode: reuse the pre-created execution record
+      const [updated] = await db
+        .update(executions)
+        .set({ status: 'running', workflowVersion: workflow.version, startedAt })
+        .where(eq(executions.id, existingExecutionId))
+        .returning();
+      if (!updated) throw new Error(`Execution record ${existingExecutionId} not found`);
+      execRecord = updated;
+    } else {
+      // Inline mode: create a new execution record
+      const [created] = await db
+        .insert(executions)
+        .values({
+          workflowId: workflow.id,
+          workflowVersion: workflow.version,
+          status: 'running',
+          mode,
+          triggerData: triggerData ?? null,
+          triggeredBy,
+          startedAt,
+        })
+        .returning();
+      execRecord = created;
+    }
 
     const nodeExecResults: NodeExecutionData[] = [];
     const nodeOutputs = new Map<string, unknown>();
     const skippedNodes = new Set<string>();
     let executionStatus: ExecutionStatus = 'success';
     let executionError: unknown = null;
+    let secrets: Record<string, string> = {};
+
+    // Broadcast execution started
+    getBroadcaster()?.broadcastToWorkflow(workflow.id, 'execution_started', {
+      execution_id: execRecord.id,
+      workflow_id: workflow.id,
+      mode,
+    });
+
+    // Log streaming: execution started
+    try {
+      getLogStreamer().emit({
+        timestamp: new Date().toISOString(),
+        level: 'info',
+        event: 'execution_started',
+        workflowId: workflow.id,
+        executionId: execRecord.id,
+        message: `Execution started (mode: ${mode})`,
+        data: { mode, triggeredBy },
+      });
+    } catch { /* log streaming must not break execution */ }
 
     try {
-      // 2. Topological sort
+      // 2. Load secrets (decrypted in-memory only for execution duration)
+      secrets = await this.loadSecrets();
+
+      // 3. Topological sort
       const sortedNodes = this.topologicalSort(workflow.nodes, workflow.connections);
 
-      // 3. Execute each node sequentially
-      for (const node of sortedNodes) {
+      // 4. Execute each node sequentially
+      for (let node of sortedNodes) {
         if (node.disabled || skippedNodes.has(node.id)) {
           nodeExecResults.push({
             nodeId: node.id,
@@ -63,19 +106,66 @@ export class WorkflowExecutor {
         // Gather input from connected upstream nodes
         const input = this.gatherInput(node.id, workflow.connections, nodeOutputs, triggerData);
 
+        // Resolve $secrets template expressions in HTTP Request node config.
+        // Clone the config first so plaintext secrets never mutate the original node.
+        if (node.type === 'http-request' && node.data?.config) {
+          const clonedConfig = JSON.parse(JSON.stringify(node.data.config));
+          this.resolveSecretsTemplates(clonedConfig, secrets);
+          node = { ...node, data: { ...node.data, config: clonedConfig } };
+        }
+
         // Build node context
         const context = createNodeContext({
           input,
           workflow,
+          secrets,
         });
+
+        // Log streaming: node started
+        try {
+          getLogStreamer().emit({
+            timestamp: new Date().toISOString(),
+            level: 'info',
+            event: 'node_started',
+            workflowId: workflow.id,
+            executionId: execRecord.id,
+            nodeId: node.id,
+            nodeName: node.name,
+            message: `Node "${node.name}" started`,
+          });
+        } catch { /* log streaming must not break execution */ }
 
         // Run the node
         const nodeExec = await runNode(node, context);
         nodeExecResults.push(nodeExec);
 
+        // Log streaming: node completed
+        try {
+          getLogStreamer().emit({
+            timestamp: new Date().toISOString(),
+            level: nodeExec.status === 'error' ? 'error' : 'info',
+            event: nodeExec.status === 'error' ? 'node_error' : 'node_completed',
+            workflowId: workflow.id,
+            executionId: execRecord.id,
+            nodeId: node.id,
+            nodeName: node.name,
+            message: `Node "${node.name}" ${nodeExec.status} (${nodeExec.duration ?? 0}ms)`,
+            data: { status: nodeExec.status, durationMs: nodeExec.duration },
+          });
+        } catch { /* log streaming must not break execution */ }
+
         if (nodeExec.status === 'success') {
           nodeOutputs.set(node.id, nodeExec.output);
         }
+
+        // Broadcast node execution result
+        getBroadcaster()?.broadcastToWorkflow(workflow.id, 'node_executed', {
+          execution_id: execRecord.id,
+          node_id: node.id,
+          node_name: node.name,
+          status: nodeExec.status,
+          duration_ms: nodeExec.duration,
+        });
 
         // Handle IF branching
         if (node.type === 'if' && nodeExec.status === 'success') {
@@ -126,18 +216,60 @@ export class WorkflowExecutor {
       .filter(n => n.status === 'success' && n.output != null)
       .pop()?.output;
 
+    // Scrub secret values from results before persisting (defense-in-depth).
+    const secretValues = Object.values(secrets);
+    const scrubbedNodeExecs = this.scrubSecrets(nodeExecResults, secretValues) as NodeExecutionData[];
+    const scrubbedResult = this.scrubSecrets(lastOutput ?? null, secretValues);
+    const scrubbedError = this.scrubSecrets(executionError ?? null, secretValues);
+
     const [updated] = await db
       .update(executions)
       .set({
         status: executionStatus,
-        nodeExecutions: nodeExecResults,
-        resultData: lastOutput ?? null,
-        error: executionError ? executionError : null,
+        nodeExecutions: scrubbedNodeExecs,
+        resultData: scrubbedResult,
+        error: scrubbedError ? scrubbedError : null,
         finishedAt,
         durationMs,
       })
       .where(eq(executions.id, execRecord.id))
       .returning();
+
+    // Broadcast execution completed
+    getBroadcaster()?.broadcastToWorkflow(workflow.id, 'execution_completed', {
+      execution_id: updated.id,
+      workflow_id: workflow.id,
+      status: executionStatus,
+      duration_ms: durationMs,
+    });
+
+    // Log streaming: execution completed
+    try {
+      getLogStreamer().emit({
+        timestamp: new Date().toISOString(),
+        level: executionStatus === 'error' ? 'error' : 'info',
+        event: executionStatus === 'error' ? 'execution_error' : 'execution_completed',
+        workflowId: workflow.id,
+        executionId: updated.id,
+        message: `Execution ${executionStatus} (${durationMs}ms)`,
+        data: { status: executionStatus, durationMs },
+      });
+    } catch { /* log streaming must not break execution */ }
+
+    // Story 2.4 AC#3: post-execution review trigger on failure
+    if (executionStatus === 'error') {
+      try {
+        getBroadcaster()?.broadcast('review_requested', workflow.id, {
+          workflow_id: workflow.id,
+          trigger: 'post-execution',
+          context_type: 'post-execution',
+          execution_id: updated.id,
+          requested_at: new Date().toISOString(),
+        });
+      } catch {
+        // Fire-and-forget — never block execution result on broadcast failure
+      }
+    }
 
     return {
       id: updated.id,
@@ -154,6 +286,95 @@ export class WorkflowExecutor {
       finishedAt: updated.finishedAt?.toISOString() ?? finishedAt.toISOString(),
       durationMs: updated.durationMs ?? durationMs,
     };
+  }
+
+  /**
+   * Load all secrets from the credentials table, decrypting each value.
+   * The returned map exists only for the duration of execution.
+   */
+  private async loadSecrets(): Promise<Record<string, string>> {
+    const secrets: Record<string, string> = {};
+    try {
+      const rows = await db
+        .select({ name: credentials.name, dataEncrypted: credentials.dataEncrypted })
+        .from(credentials);
+      for (const row of rows) {
+        try {
+          secrets[row.name] = decrypt(row.dataEncrypted);
+        } catch {
+          // Skip secrets that fail to decrypt — do not block execution.
+        }
+      }
+    } catch {
+      // If credentials table is unavailable, run with empty secrets.
+    }
+    return secrets;
+  }
+
+  /**
+   * Resolve {{$secrets.KEY_NAME}} template expressions in HTTP Request
+   * node config fields (url, headers, body).
+   */
+  /**
+   * Resolve {{$secrets.KEY_NAME}} template expressions in a config object.
+   * The config is expected to be a deep-cloned copy — this method mutates it.
+   */
+  private resolveSecretsTemplates(
+    config: Record<string, unknown>,
+    secrets: Record<string, string>,
+  ): void {
+    const resolve = (val: unknown): unknown => {
+      if (typeof val !== 'string') return val;
+      return val.replace(/\{\{\$secrets\.([A-Za-z0-9_-]+)\}\}/g, (_match, key: string) => {
+        if (key in secrets) return secrets[key];
+        throw new Error(
+          `Secret '${key}' not found. Check that a secret with this name exists.`,
+        );
+      });
+    };
+
+    if (typeof config.url === 'string') config.url = resolve(config.url);
+    if (typeof config.body === 'string') config.body = resolve(config.body);
+    if (typeof config.token === 'string') config.token = resolve(config.token);
+    if (typeof config.username === 'string') config.username = resolve(config.username);
+    if (typeof config.password === 'string') config.password = resolve(config.password);
+
+    if (config.headers && typeof config.headers === 'object') {
+      const headers = config.headers as Record<string, string>;
+      for (const [k, v] of Object.entries(headers)) {
+        if (typeof v === 'string') {
+          headers[k] = resolve(v) as string;
+        }
+      }
+    }
+  }
+
+  /**
+   * Scrub known secret values from execution results before persisting.
+   * Defense-in-depth: prevents Code nodes from leaking secrets via return values.
+   */
+  private scrubSecrets(data: unknown, secretValues: string[]): unknown {
+    if (secretValues.length === 0) return data;
+    if (typeof data === 'string') {
+      let result = data;
+      for (const sv of secretValues) {
+        if (sv && result.includes(sv)) {
+          result = result.replaceAll(sv, '[REDACTED]');
+        }
+      }
+      return result;
+    }
+    if (Array.isArray(data)) {
+      return data.map((v) => this.scrubSecrets(v, secretValues));
+    }
+    if (data && typeof data === 'object') {
+      const out: Record<string, unknown> = {};
+      for (const [k, v] of Object.entries(data as Record<string, unknown>)) {
+        out[k] = this.scrubSecrets(v, secretValues);
+      }
+      return out;
+    }
+    return data;
   }
 
   /**
