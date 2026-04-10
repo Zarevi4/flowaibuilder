@@ -27,6 +27,7 @@ const FORM_MAP: Record<string, React.ComponentType<{ nodeId: string; config: Rec
 function StatusBadge({ status }: { status: ExecutionStatus }) {
   const colorMap: Record<ExecutionStatus, string> = {
     pending: 'bg-gray-700 text-gray-300',
+    queued: 'bg-yellow-900/50 text-yellow-300',
     running: 'bg-blue-900/50 text-blue-300',
     success: 'bg-green-900/50 text-green-300',
     error: 'bg-red-900/50 text-red-300',
